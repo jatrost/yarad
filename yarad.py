@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-
-# yarad - Yara daemon
-# AlienVault Labs - https://github.com/jaimeblasco/AlienvaultLabs
 #
 # Licensed under GNU/GPLv3
-# aortega@alienvault.com
+#
+# This version of yara is derived from aortega@alienvault.com's https://github.com/jaimeblasco/AlienvaultLabs
+# 
 
 import glob
 import yara
@@ -14,91 +13,82 @@ import os
 import ConfigParser
 import sys
 import json
+import time
 
-config = ConfigParser.ConfigParser()
-config.read("yarad.cfg")
-
-daemonize = config.getint("server", "daemon")
-if daemonize == 1:
-    import daemon
-
-rules_f = config.get("server", "rules_file")
-pidfile = config.get("server", "pidfile")
-
-srv_config = {}
-srv_config["host"] = config.get("inet", "host")
-srv_config["port"] = config.getint("inet", "port")
-
-def linesplit(socket):
-    # untested
-    buffer = socket.recv(4096)
-    done = False
-    while not done:
-        if "\n" in buffer:
-            (line, buffer) = buffer.split("\n", 1)
-            yield line+"\n"
-        else:
-            more = socket.recv(4096)
-            if not more:
-                done = True
-            else:
-                buffer = buffer+more
-    if buffer:
-        yield buffer
-
-def dispatch_client_inet_socket(conn, rules):
-    infile = conn.makefile()
-    f = ""
+def dispatch_client_inet_socket(connfile, rules, max_size_mb):
     while True:
         try:
-            f = infile.readline()
-            if not f: break
-
-            f = f.rstrip("\n\r")
-            if os.path.exists(f) and os.path.isfile(f):
-                matches = []
-                for i in rules.match(f):
-                    matches.append({
-                        "name": i.rule, "namespace": i.namespace,
-                        "meta": i.meta, "tags": i.tags
-                    })
-                infile.write(json.dumps(matches)+"\n")
+            filepath = connfile.readline()
+            if not filepath: break
+  
+            start = time.time()          
+            matches = []
+            res = {'matches':matches}
+            filepath = filepath.rstrip("\n\r")
+            if os.path.exists(filepath):
+                if os.path.isfile(filepath):
+                    size = os.stat(filepath).st_size
+                    if size > max_size_mb:
+                        res['error'] = 'file size too large, size > %d bytes'%max_size_mb
+                    else:
+                        for i in rules.match(filepath):
+                            matches.append({
+                                "name": i.rule, "namespace": i.namespace,
+                                "meta": i.meta, "tags": i.tags
+                            })
+                else:
+                    res['error'] = 'not a file'
             else:
-                infile.write("[]\n")
-            infile.flush()
+                res['error'] = 'file not found'
+            end = time.time()
+            res['exec_time'] = "%.2fms"%((end-start)*1000)
+            connfile.write(json.dumps(res)+"\n")
+            connfile.flush()
         except:
             break
-    infile.close()
+    connfile.close()
 
 def write_pidfile(pidfile):
-    f = open(pidfile, "w")
-    f.write("%s\n" % (str(os.getpid())))
-    f.close()
+    with open(pidfile, "w") as pid_file:
+        pid_file.write("%s\n" % (str(os.getpid())))
 
-def mainloop(rules, srv_config):
+def mainloop(rules, host, port, max_size_mb):
+    print "[*] Listening on %s:%d ..."%(host, port)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((srv_config["host"], srv_config["port"]))
+    server.bind((host, port))
     server.listen(1)
     while True:
         conn, addr = server.accept()
-        p = Process(target=dispatch_client_inet_socket, args=(conn, rules))
+        print "[*] Accepted connection from %s:%d ..."%(addr[0], addr[1])
+        p = Process(target=dispatch_client_inet_socket, args=(conn.makefile(), rules, max_size_mb))
         p.start()
     server.close()
 
-print "[*] Starting"
-print "[*] Loading rules (%s) ... " % (rules_f),
-sys.stdout.flush()
+if  __name__ =='__main__':
+    print "[*] Starting ..."
+    config = ConfigParser.ConfigParser()
+    config.read("yarad.cfg")
 
-sigs = dict([(name.replace(".yara", "").split("/")[-1], name) for name in glob.glob(rules_f+"/*.yara")])
-rules = yara.compile(filepaths=sigs)
-print "OK"
+    rules_dir   = config.get("server", "rules_dir")
+    pidfile     = config.get("server", "pidfile")
+    host        = config.get("server", "host")
+    port        = config.getint("server", "port")
+    max_size_mb = config.getfloat("server", "max_size_mb")*(2**20)
 
-if daemonize == 1:
-    print "[*] Forking ..."
-    with daemon.DaemonContext():
+    print "[*] Loading rules (%s) ... " % (rules_dir)
+    sys.stdout.flush()
+
+    sigs = dict([(name.replace(".yara", "").split("/")[-1], name) for name in glob.glob(rules_dir+"/*.yara")])
+    rules = yara.compile(filepaths=sigs)
+    print "[*] Rules loaded"
+
+    if config.getint("server", "daemon") == 1:
+        print "[*] Forking ..."
+        import daemon
+        with daemon.DaemonContext():
+            write_pidfile(pidfile)
+            mainloop(rules, host, port, max_size_mb)
+    else:
         write_pidfile(pidfile)
-        mainloop(rules, srv_config)
-else:
-    write_pidfile(pidfile)
-    mainloop(rules, srv_config)
+        mainloop(rules, host, port, max_size_mb)
 
